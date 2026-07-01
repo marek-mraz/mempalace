@@ -39,6 +39,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -195,9 +196,27 @@ class KnowledgeGraph:
 
     def _conn(self):
         if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            # Install the busy handler FIRST so every later statement (DDL in
+            # _init_db, the INSERTs in add_triple) queues and retries for up to
+            # 5s on a locked write instead of raising "database is locked" — the
+            # graceful cross-process queuing an agent swarm sharing the KG needs.
+            conn.execute("PRAGMA busy_timeout=5000")
+            # Switching a fresh DB to WAL needs a brief EXCLUSIVE lock, and
+            # SQLite does NOT run the busy handler for that transition, so a
+            # swarm racing to create the KG can still get "database is locked"
+            # right here. WAL is a persistent header property, so retry briefly:
+            # once any one process wins the switch, this is a no-op for the rest.
+            for attempt in range(100):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 99:
+                        raise
+                    time.sleep(0.05)
+            conn.row_factory = sqlite3.Row
+            self._connection = conn
         return self._connection
 
     def close(self):

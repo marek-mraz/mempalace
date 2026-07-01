@@ -400,6 +400,18 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
         return True, ""
 
+    # Server-mode backends (pgvector, qdrant) route every write through an
+    # external DB that serializes concurrent multi-process writers itself
+    # (Postgres MVCC etc.), so no writer ever sees stale peer state. The
+    # process-lifetime flock latch below exists only to stop a peer process
+    # corrupting a local-mode backend's in-process HNSW/FTS cache (chroma,
+    # sqlite_exact). Skipping it lets a swarm of MCP servers write the same
+    # server-mode palace concurrently — each tool call is its own DB
+    # transaction, and the shared KG SQLite is WAL + busy_timeout so it queues
+    # rather than crashing. See _backend_serializes_writers.
+    if _backend_serializes_writers():
+        return True, ""
+
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
@@ -1162,6 +1174,26 @@ def _is_chroma_backend() -> bool:
         return _selected_backend_name() == "chroma"
     except Exception:
         logger.debug("backend resolution failed", exc_info=True)
+        return False
+
+
+def _backend_serializes_writers() -> bool:
+    """True when the vector store handles concurrent multi-process writes itself.
+
+    Server-mode backends (pgvector, qdrant) advertise the ``server_mode``
+    capability: writes go to an external DB with its own transactional
+    concurrency control, so the MCP process needs no per-process writer latch.
+    Local-mode backends (chroma, sqlite_exact) keep in-process HNSW/FTS state
+    that goes stale when a peer process writes the same files — those keep the
+    latch. Defaults to False (keep the latch) when the backend can't be
+    resolved, so an unknown backend stays on the safe path.
+    """
+    try:
+        from .backends import get_backend_class
+
+        return "server_mode" in get_backend_class(_selected_backend_name()).capabilities
+    except Exception:
+        logger.debug("backend capability probe failed", exc_info=True)
         return False
 
 
