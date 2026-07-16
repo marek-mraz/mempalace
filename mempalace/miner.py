@@ -447,7 +447,9 @@ def load_config(project_dir: str) -> dict:
             # raw-name wing while ``topics_by_wing`` was keyed under the
             # normalized slug, silently dropping every topic tunnel
             # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
+            wing_name = normalize_wing_name(
+                os.environ.get("MEMPALACE_PROJECT") or resolved_project_dir.name
+            )
             print(
                 f"  No mempalace.yaml found in {resolved_project_dir} "
                 f"— using auto-detected defaults (wing='{wing_name}'). "

@@ -340,6 +340,11 @@ class MempalaceConfig:
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
+        project = os.environ.get("MEMPALACE_PROJECT")
+        if project:
+            # One env var → per-project palace + pgvector namespace, for
+            # sandboxes where every project mounts at the same path.
+            return os.path.expanduser(f"~/.mempalace/palaces/{project.strip()}/palace")
         return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
 
     @property
@@ -439,7 +444,9 @@ class MempalaceConfig:
     @property
     def pgvector_namespace(self):
         """Optional pgvector table namespace/prefix for multi-tenant isolation."""
-        env_val = os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE") or os.environ.get(
+            "MEMPALACE_PROJECT"
+        )
         if env_val:
             return env_val.strip()
         value = self._file_config.get("pgvector_namespace")

@@ -425,7 +425,7 @@ def cmd_init(args):
             # ``mempalace.yaml`` so the miner's tunnel lookup hits the
             # same key in ``topics_by_wing`` at mine time (issue #1194 —
             # without this, hyphenated dirnames silently lose tunnels).
-            wing = normalize_wing_name(project_path.name)
+            wing = normalize_wing_name(os.environ.get("MEMPALACE_PROJECT") or project_path.name)
             registry_path = add_to_known_entities(confirmed, wing=wing)
             print(f"  Registry updated: {registry_path}")
     else:
@@ -545,6 +545,13 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if not args.wing and os.environ.get("MEMPALACE_PROJECT"):
+        # Sandbox setups mount every project at the same path, so the
+        # dirname-derived default wing would collide; MEMPALACE_PROJECT
+        # carries the real project identity. Explicit --wing still wins.
+        from .config import normalize_wing_name
+
+        args.wing = normalize_wing_name(os.environ["MEMPALACE_PROJECT"])
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
