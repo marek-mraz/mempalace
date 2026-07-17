@@ -973,7 +973,11 @@ def _vector_disabled_search(
 
 def _open_search_collection(palace_path: str, collection_name: str):
     try:
-        return get_collection(palace_path, collection_name=collection_name, create=False), None
+        # MEMPALACE_PROJECT names a per-project sandbox palace: open in create
+        # mode so a freshly opened project searches as empty instead of
+        # erroring with "No palace found" before its first write.
+        create = bool(os.environ.get("MEMPALACE_PROJECT"))
+        return get_collection(palace_path, collection_name=collection_name, create=create), None
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
     except KeyError as e:

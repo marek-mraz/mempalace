@@ -914,6 +914,11 @@ def _get_collection(create=False):
     scratch, so the second attempt heals the common stale-handle case
     automatically.
     """
+    # MEMPALACE_PROJECT explicitly names a per-project sandbox palace: always
+    # bootstrap it on first touch (any tool, reads included) so a freshly
+    # opened project needs no manual `mempalace init`. #830's accidental-
+    # creation concern doesn't apply — the project key is deliberate.
+    create = create or bool(os.environ.get("MEMPALACE_PROJECT"))
     global \
         _client_cache, \
         _collection_cache, \
