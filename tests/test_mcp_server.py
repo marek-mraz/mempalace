@@ -2826,6 +2826,24 @@ class TestDeleteBySource:
 
 
 class TestKGTools:
+    def test_resolve_kg_path_isolated_by_mempalace_project(self, monkeypatch):
+        """MEMPALACE_PROJECT must scope the KG into the per-project palace dir,
+        not the shared DEFAULT_KG_PATH (parity with drawer isolation)."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+        monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+
+        monkeypatch.delenv("MEMPALACE_PROJECT", raising=False)
+        assert mcp_server._resolve_kg_path() == mcp_server.DEFAULT_KG_PATH
+
+        monkeypatch.setenv("MEMPALACE_PROJECT", "proj_a")
+        path = mcp_server._resolve_kg_path()
+        assert path == os.path.join(mcp_server._config.palace_path, "knowledge_graph.sqlite3")
+        assert f"palaces{os.sep}proj_a" in path
+        assert path != mcp_server.DEFAULT_KG_PATH
+
     def test_kg_add(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_kg_add

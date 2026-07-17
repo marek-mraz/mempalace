@@ -598,7 +598,9 @@ def _mcp_idle_timeout_secs() -> float:
 
 
 def _resolve_kg_path() -> str:
-    if _palace_flag_given:
+    # MEMPALACE_PROJECT isolates the KG alongside the drawers: the graph
+    # lives inside the per-project palace dir, not the shared default file.
+    if _palace_flag_given or os.environ.get("MEMPALACE_PROJECT"):
         return os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
     return DEFAULT_KG_PATH
 
