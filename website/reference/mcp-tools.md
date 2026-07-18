@@ -187,6 +187,20 @@ Fetch a single drawer by ID — returns full content and metadata.
 
 ---
 
+### `mempalace_get_pdf_pages`
+
+Return the full text (markdown) of a PDF page range — 1-based and inclusive, like a PDF viewer. Use after a search hit that carries `pdf_page`: a hit on page 45 → `get_pdf_pages(source_path, 43, 46)` reads the whole surrounding pages verbatim. Works on any readable PDF path, indexed or not. Out-of-range bounds are clamped to the document. Requires the `mempalace[extract]` extra (pymupdf4llm).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | **Yes** | Path to the PDF (use `source_path` from a search hit) |
+| `start` | integer | **Yes** | First page (1-based) |
+| `end` | integer | No | Last page, inclusive (default: same as `start`) |
+
+**Returns:** `{ path, filename, pages, total_pages, text }` — or `{ error }` when the PDF is missing, the range is empty, or pymupdf4llm is not installed.
+
+---
+
 ### `mempalace_list_drawers`
 
 List drawers with pagination. Optional wing/room filter. Returns IDs, wings, rooms, and content previews.

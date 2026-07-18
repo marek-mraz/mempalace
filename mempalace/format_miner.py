@@ -456,27 +456,27 @@ def extract_text(
 
 
 def _extract_pdf_page_chunks(path: Path, palace_config) -> tuple:
-    """Per-page PDF extraction. Returns ``(chunks, text, status)``.
+    """Per-page PDF extraction. Returns ``(chunks, text)`` or ``(None, None)``.
 
-    ``chunks is None`` means pymupdf4llm is not installed — the caller falls
-    back to the MarkItDown path, which flattens the document and loses page
-    numbers. On OK, every chunk dict carries a 1-based ``pdf_page`` and
-    ``text`` is the full joined document (for room detection / content-date).
+    ``(None, None)`` means "fall back to the MarkItDown path" — pymupdf4llm
+    is not installed, raised on this file, or extracted nothing. The fallback
+    re-attempts the file and owns all skip-status classification (encrypted,
+    extraction error, …), so upstream's error handling stays the single
+    source of truth; this path only ever *adds* page numbers, never loses a
+    document that MarkItDown could have read. On success, every chunk dict
+    carries a 1-based ``pdf_page`` and ``text`` is the full joined document
+    (for room detection / content-date).
     """
     try:
         import pymupdf4llm
     except ImportError:
         logger.info("pymupdf4llm not installed — no page numbers for %s", path)
-        return None, None, None
+        return None, None
     try:
         pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
-    except Exception as exc:
-        msg = str(exc)
-        if _ENCRYPTED_PATTERNS.search(msg):
-            logger.info("skip:encrypted %s — %s", path, msg[:120])
-            return [], None, ExtractionStatus.SKIP_ENCRYPTED
-        logger.warning("skip:extraction_error %s — %s: %s", path, type(exc).__name__, msg[:200])
-        return [], None, ExtractionStatus.SKIP_EXTRACTION_ERROR
+    except Exception:
+        logger.debug("pymupdf4llm failed on %s; falling back to MarkItDown", path, exc_info=True)
+        return None, None
 
     chunks: list = []
     texts: list = []
@@ -500,33 +500,34 @@ def _extract_pdf_page_chunks(path: Path, palace_config) -> tuple:
                 piece["pdf_page"] = page_no
             chunks.append(piece)
     if not chunks:
-        return [], None, ExtractionStatus.SKIP_EXTRACTION_ERROR
-    return chunks, "\n\n".join(texts), ExtractionStatus.OK
+        return None, None
+    return chunks, "\n\n".join(texts)
 
 
 def _extract_and_chunk(filepath: Path, source_file: str, palace_config) -> tuple:
     """Extract + chunk one file. Returns ``(chunks, text, status)``.
 
     PDFs go through the page-aware pymupdf4llm path first (chunks carry a
-    1-based ``pdf_page``); everything else — and PDFs when pymupdf4llm is
-    not installed — through the ``extract_text`` + ``chunk_text`` path.
-    ``chunks == []`` with status OK means EMPTY_AFTER_CHUNK. Chunk sizing
-    follows the user's MempalaceConfig (per PR #1555 review, Gemini #3).
+    1-based ``pdf_page``); everything else — and PDFs whenever that path
+    declines (pymupdf4llm missing, failed, or empty) — through the
+    ``extract_text`` + ``chunk_text`` path. ``chunks == []`` with status OK
+    means EMPTY_AFTER_CHUNK. Chunk sizing follows the user's MempalaceConfig
+    (per PR #1555 review, Gemini #3).
     """
-    chunks = None
     if filepath.suffix.lower() == ".pdf":
-        chunks, text, status = _extract_pdf_page_chunks(filepath, palace_config)
-    if chunks is None:
-        text, status = extract_text(filepath)
-        if status != ExtractionStatus.OK or not text:
-            return None, text, status
-        chunks = chunk_text(
-            text,
-            source_file,
-            chunk_size=palace_config.chunk_size,
-            chunk_overlap=palace_config.chunk_overlap,
-            min_chunk_size=palace_config.min_chunk_size,
-        )
+        chunks, text = _extract_pdf_page_chunks(filepath, palace_config)
+        if chunks is not None:
+            return chunks, text, ExtractionStatus.OK
+    text, status = extract_text(filepath)
+    if status != ExtractionStatus.OK or not text:
+        return None, text, status
+    chunks = chunk_text(
+        text,
+        source_file,
+        chunk_size=palace_config.chunk_size,
+        chunk_overlap=palace_config.chunk_overlap,
+        min_chunk_size=palace_config.min_chunk_size,
+    )
     return chunks, text, status
 
 

@@ -31,8 +31,8 @@ def pdf(tmp_path):
 
 
 def test_page_chunks_carry_pdf_page(pdf):
-    chunks, text, status = _extract_pdf_page_chunks(pdf, MempalaceConfig())
-    assert status.name == "OK" and text
+    chunks, text = _extract_pdf_page_chunks(pdf, MempalaceConfig())
+    assert chunks and text
     assert sorted({c["pdf_page"] for c in chunks}) == [1, 2, 3, 4, 5]
     # chunk_index re-numbered globally and unique per file
     assert [c["chunk_index"] for c in chunks] == list(range(len(chunks)))
@@ -58,6 +58,13 @@ def test_read_pdf_pages_errors(pdf, tmp_path):
         read_pdf_pages(tmp_path / "missing.pdf", 1)
     with pytest.raises(ValueError):
         read_pdf_pages(pdf, 9, 12)  # both bounds past the end
+
+
+def test_broken_pdf_falls_back_to_markitdown_path(tmp_path):
+    """Unparseable PDF bytes → (None, None) so extract_text owns the skip."""
+    stub = tmp_path / "broken.pdf"
+    stub.write_bytes(b"%PDF-1.4 stub")
+    assert _extract_pdf_page_chunks(stub, MempalaceConfig()) == (None, None)
 
 
 def test_mcp_tool_registered_and_error_dict(pdf, tmp_path):
