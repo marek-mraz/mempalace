@@ -450,6 +450,122 @@ def extract_text(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PDF page-aware path (pymupdf4llm) — chunks carry a 1-based ``pdf_page`` so
+# search hits can be expanded to whole pages via ``read_pdf_pages`` below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _extract_pdf_page_chunks(path: Path, palace_config) -> tuple:
+    """Per-page PDF extraction. Returns ``(chunks, text, status)``.
+
+    ``chunks is None`` means pymupdf4llm is not installed — the caller falls
+    back to the MarkItDown path, which flattens the document and loses page
+    numbers. On OK, every chunk dict carries a 1-based ``pdf_page`` and
+    ``text`` is the full joined document (for room detection / content-date).
+    """
+    try:
+        import pymupdf4llm
+    except ImportError:
+        logger.info("pymupdf4llm not installed — no page numbers for %s", path)
+        return None, None, None
+    try:
+        pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+    except Exception as exc:
+        msg = str(exc)
+        if _ENCRYPTED_PATTERNS.search(msg):
+            logger.info("skip:encrypted %s — %s", path, msg[:120])
+            return [], None, ExtractionStatus.SKIP_ENCRYPTED
+        logger.warning("skip:extraction_error %s — %s: %s", path, type(exc).__name__, msg[:200])
+        return [], None, ExtractionStatus.SKIP_EXTRACTION_ERROR
+
+    chunks: list = []
+    texts: list = []
+    for pg in pages:
+        md = pg.get("metadata") or {}
+        page_no = md.get("page_number") or md.get(
+            "page"
+        )  # 1-based; key renamed across pymupdf4llm versions
+        page_text = (pg.get("text") or "").strip()
+        if page_text:
+            texts.append(page_text)
+        for piece in chunk_text(
+            page_text,
+            str(path),
+            chunk_size=palace_config.chunk_size,
+            chunk_overlap=palace_config.chunk_overlap,
+            min_chunk_size=palace_config.min_chunk_size,
+        ):
+            piece["chunk_index"] = len(chunks)  # re-number globally per file
+            if page_no is not None:
+                piece["pdf_page"] = page_no
+            chunks.append(piece)
+    if not chunks:
+        return [], None, ExtractionStatus.SKIP_EXTRACTION_ERROR
+    return chunks, "\n\n".join(texts), ExtractionStatus.OK
+
+
+def _extract_and_chunk(filepath: Path, source_file: str, palace_config) -> tuple:
+    """Extract + chunk one file. Returns ``(chunks, text, status)``.
+
+    PDFs go through the page-aware pymupdf4llm path first (chunks carry a
+    1-based ``pdf_page``); everything else — and PDFs when pymupdf4llm is
+    not installed — through the ``extract_text`` + ``chunk_text`` path.
+    ``chunks == []`` with status OK means EMPTY_AFTER_CHUNK. Chunk sizing
+    follows the user's MempalaceConfig (per PR #1555 review, Gemini #3).
+    """
+    chunks = None
+    if filepath.suffix.lower() == ".pdf":
+        chunks, text, status = _extract_pdf_page_chunks(filepath, palace_config)
+    if chunks is None:
+        text, status = extract_text(filepath)
+        if status != ExtractionStatus.OK or not text:
+            return None, text, status
+        chunks = chunk_text(
+            text,
+            source_file,
+            chunk_size=palace_config.chunk_size,
+            chunk_overlap=palace_config.chunk_overlap,
+            min_chunk_size=palace_config.min_chunk_size,
+        )
+    return chunks, text, status
+
+
+def read_pdf_pages(path: Union[Path, str], start: int, end: int = 0) -> dict:
+    """Full markdown text of PDF pages ``start``..``end`` — 1-based, inclusive,
+    like a PDF viewer. ``end`` omitted = just one page.
+
+    The whole-page retrieval primitive behind the ``mempalace_get_pdf_pages``
+    MCP tool: a search hit with ``pdf_page`` 45 → ``read_pdf_pages(path, 43,
+    46)`` returns those complete pages verbatim. Works on any readable PDF,
+    indexed or not. Out-of-bounds ranges are clamped.
+    """
+    try:
+        import pymupdf
+        import pymupdf4llm
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF page retrieval requires pymupdf4llm — install mempalace[extract]"
+        ) from exc
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise ValueError(f"PDF not found: {p}")
+    with pymupdf.open(p) as doc:
+        total = doc.page_count
+    end = end or start
+    start, end = max(1, int(start)), min(int(end), total)
+    if start > end:
+        raise ValueError(f"empty page range (document has {total} pages)")
+    text = pymupdf4llm.to_markdown(str(p), pages=list(range(start - 1, end)))
+    return {
+        "path": str(p),
+        "filename": p.name,
+        "pages": f"{start}-{end}",
+        "total_pages": total,
+        "text": text,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Directory walker
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -667,6 +783,10 @@ def _file_chunks_locked(
                     meta["line_start"] = chunk["line_start"]
                 if chunk.get("line_end") is not None:
                     meta["line_end"] = chunk["line_end"]
+                # PDF page number (1-based), set by the pymupdf4llm PDF path —
+                # lets search hits be expanded via mempalace_get_pdf_pages.
+                if chunk.get("pdf_page") is not None:
+                    meta["pdf_page"] = chunk["pdf_page"]
                 # Tier 6a content-date: shared across all chunks of the file.
                 if file_content_date:
                     meta["content_date"] = file_content_date
@@ -842,7 +962,7 @@ def mine_formats(
                     files_skipped += 1
                     continue
 
-                text, status = extract_text(filepath)
+                chunks, text, status = _extract_and_chunk(filepath, source_file, palace_config)
                 status_counts[status.name] += 1
 
                 if status != ExtractionStatus.OK or not text:
@@ -852,17 +972,6 @@ def mine_formats(
                         )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} {status.name}")
                     continue
-
-                # Thread the user's MempalaceConfig chunk parameters through
-                # so format-mode mining honors their tuning. Per PR #1555
-                # review (Gemini #3).
-                chunks = chunk_text(
-                    text,
-                    source_file,
-                    chunk_size=palace_config.chunk_size,
-                    chunk_overlap=palace_config.chunk_overlap,
-                    min_chunk_size=palace_config.min_chunk_size,
-                )
                 if not chunks:
                     if not dry_run:
                         _register_file(collection, source_file, wing, agent)

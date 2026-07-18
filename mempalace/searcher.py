@@ -237,6 +237,18 @@ def _hybrid_rank(
     return results
 
 
+def _attach_pdf_page(entry: dict, meta: dict) -> dict:
+    """Copy a PDF-mined drawer's 1-based ``pdf_page`` onto a result entry.
+
+    Present only on drawers mined by the format miner's pymupdf4llm path —
+    callers use it with ``mempalace_get_pdf_pages`` to read whole pages
+    around a hit. Non-PDF entries stay untouched (no null-noise key).
+    """
+    if meta.get("pdf_page") is not None:
+        entry["pdf_page"] = meta["pdf_page"]
+    return entry
+
+
 def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
     """Build a ChromaDB where filter from optional wing/room/source_file.
 
@@ -684,28 +696,27 @@ def _bm25_only_via_sqlite(
         if source_file and meta.get("source_file") != source_file:
             continue
         full_source = meta.get("source_file", "") or ""
-        candidates.append(
-            {
-                "text": d["text"],
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
-                "source_path": full_source,
-                "created_at": meta.get("filed_at", "unknown"),
-                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-                # No vector distance available in BM25-only mode.
-                "similarity": None,
-                "distance": None,
-                "matched_via": "bm25_sqlite",
-                # Internal: full path + chunk_index let callers (notably
-                # candidate_strategy="union") dedupe at chunk granularity
-                # rather than basename — two files in different directories
-                # may share a basename, and one source_file is split across
-                # multiple chunks. Stripped before this helper returns.
-                "_source_file_full": full_source,
-                "_chunk_index": meta.get("chunk_index"),
-            }
-        )
+        candidate = {
+            "text": d["text"],
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            "source_file": Path(full_source).name if full_source else "?",
+            "source_path": full_source,
+            "created_at": meta.get("filed_at", "unknown"),
+            "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+            # No vector distance available in BM25-only mode.
+            "similarity": None,
+            "distance": None,
+            "matched_via": "bm25_sqlite",
+            # Internal: full path + chunk_index let callers (notably
+            # candidate_strategy="union") dedupe at chunk granularity
+            # rather than basename — two files in different directories
+            # may share a basename, and one source_file is split across
+            # multiple chunks. Stripped before this helper returns.
+            "_source_file_full": full_source,
+            "_chunk_index": meta.get("chunk_index"),
+        }
+        candidates.append(_attach_pdf_page(candidate, meta))
 
     # Local BM25 over the candidate set.
     docs = [c["text"] for c in candidates]
@@ -1230,6 +1241,7 @@ def search_memories(
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
         }
+        _attach_pdf_page(entry, meta)
         if closet_preview:
             entry["closet_preview"] = closet_preview
         scored.append(entry)

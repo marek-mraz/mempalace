@@ -2078,6 +2078,16 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         return {"error": "Duplicate check failed"}
 
 
+def tool_get_pdf_pages(path: str, start: int, end: int = 0):
+    """Full text of PDF pages start..end (1-based, inclusive) as markdown."""
+    from .format_miner import read_pdf_pages
+
+    try:
+        return read_pdf_pages(path, start, end)
+    except (RuntimeError, ValueError) as e:
+        return {"error": str(e)}
+
+
 def tool_get_aaak_spec():
     """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
@@ -4086,7 +4096,7 @@ TOOLS = {
         "handler": tool_follow_tunnels,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
+        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out. PDF-mined hits also carry 'pdf_page' (1-based) — expand a hit with mempalace_get_pdf_pages(source_path, page-2, page+1) to read the whole surrounding pages.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4307,6 +4317,36 @@ TOOLS = {
             },
         },
         "handler": tool_sync,
+    },
+    "mempalace_get_pdf_pages": {
+        "description": (
+            "Return the full text (markdown) of a PDF page range — 1-based and "
+            "inclusive, like a PDF viewer. Use after a search hit that carries "
+            "'pdf_page': e.g. a hit on page 45 → get_pdf_pages(source_path, 43, 46) "
+            "reads the whole surrounding pages verbatim. Works on any readable "
+            "PDF path, indexed or not."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the PDF (use 'source_path' from a search hit)",
+                },
+                "start": {
+                    "type": "integer",
+                    "description": "First page (1-based)",
+                    "minimum": 1,
+                },
+                "end": {
+                    "type": "integer",
+                    "description": "Last page, inclusive (default: same as start)",
+                    "minimum": 1,
+                },
+            },
+            "required": ["path", "start"],
+        },
+        "handler": tool_get_pdf_pages,
     },
     "mempalace_get_drawer": {
         "description": "Fetch a single drawer by ID — returns full content and metadata.",
