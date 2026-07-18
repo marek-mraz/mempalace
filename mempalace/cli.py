@@ -259,14 +259,16 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     if not (project_path / ".git").exists():
         return False
     gitignore = project_path / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
+    # Force UTF-8: Windows defaults to GBK and chokes on non-ASCII .gitignore
+    # comments, killing auto-init even though the file is valid UTF-8.
+    existing = gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.exists() else ""
     existing_lines = {line.strip() for line in existing.splitlines()}
     missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
     if not missing:
         return False
     prefix = "" if not existing or existing.endswith("\n") else "\n"
     block = prefix + "\n# MemPalace per-project files (issue #185)\n" + "\n".join(missing) + "\n"
-    with open(gitignore, "a") as f:
+    with open(gitignore, "a", encoding="utf-8") as f:
         f.write(block)
     print(f"  Added {', '.join(missing)} to {gitignore.name}")
     return True
@@ -1012,7 +1014,15 @@ def cmd_hallways(args):
     """List within-wing entity hallways (the auto-built associative graph)."""
     from .hallways import list_hallways
 
-    rows = list_hallways(getattr(args, "wing", None))
+    palace_path = (
+        os.path.expanduser(args.palace)
+        if getattr(args, "palace", None)
+        else MempalaceConfig().palace_path
+    )
+    rows = list_hallways(
+        getattr(args, "wing", None),
+        config=MempalaceConfig(palace_path=palace_path),
+    )
     if not rows:
         print("No hallways yet — they are built from drawer entities when you mine.")
         return
@@ -1139,7 +1149,7 @@ def cmd_repair(args):
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from .migrate import confirm_destructive_action
-        from .repair import RebuildPartialError, rebuild_from_sqlite
+        from .repair import RebuildCleanupError, RebuildPartialError, rebuild_from_sqlite
 
         source_path = getattr(args, "source", None)
         source_path = (
@@ -1176,6 +1186,13 @@ def cmd_repair(args):
                 "\n  Rebuild partial — see message above. "
                 f"Failed in collection: {exc.failed_collection}"
             )
+            sys.exit(1)
+        except RebuildCleanupError:
+            # All rows may have landed, but rebuild_from_sqlite deliberately
+            # withholds success until FTS5 rebuild, VACUUM, and quick_check are
+            # clean. Its exception already includes the retained destination
+            # and archive/source recovery paths.
+            print("\n  Rebuild cleanup failed — see recovery details above.")
             sys.exit(1)
         # An empty counts dict is rebuild_from_sqlite's documented signal
         # for a validation refusal (missing source, existing dest,

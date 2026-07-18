@@ -8,19 +8,20 @@ memory instead of a palace on each laptop.
 This is built from three pieces that already ship in MemPalace:
 
 - the **HTTP transport** for the MCP server (`mempalace-mcp --transport http`),
-- a **networked storage backend** ([Qdrant](https://qdrant.tech/) or
-  [Postgres + pgvector](/guide/configuration)),
+- a **networked storage backend** ([Milvus / Zilliz Cloud](https://milvus.io/),
+  [Qdrant](https://qdrant.tech/), or [Postgres + pgvector](/guide/configuration)),
 - optional **GPU embedding** on the server.
 
 ::: warning This is a deliberate step away from single-machine local-first
 By default MemPalace keeps everything on your own machine. A central server is
-still **your** infrastructure — no third-party API, no telemetry, nothing
-phones home — but your verbatim memory now lives on a server you operate and
-travels over your network. Run every component (Qdrant, the MCP host) on
-hardware you control, put it on a private network or VPN, and treat the
-bearer token and TLS setup below as mandatory, not optional. Embeddings are
-still produced locally on the server by MemPalace; only your own storage
-backend ever receives the vectors and text.
+still **your** infrastructure — no telemetry, nothing phones home — but your
+verbatim memory now lives on a server you operate and travels over your
+network. If you choose a managed backend such as Zilliz Cloud, that backend
+also receives the vectors and text by design. Run every self-hosted component
+(Milvus, Qdrant, Postgres, the MCP host) on hardware you control, put it on a
+private network or VPN, and treat the bearer token and TLS setup below as
+mandatory, not optional. Embeddings are still produced locally on the server by
+MemPalace.
 :::
 
 ## Architecture
@@ -32,14 +33,32 @@ backend ever receives the vectors and text.
                                       └─────────────┬───────────────
                                                     │ vectors + verbatim text
                                                     ▼
-                                              Qdrant / pgvector
+                                              Milvus / Qdrant / pgvector
                                               (central storage)
 ```
 
 ## 1. Central storage
 
-Pick a networked backend so all clients share one palace. **Qdrant** needs no
-extra Python package — MemPalace talks to its REST API directly.
+Pick a networked backend so all clients share one palace. **Milvus** can point
+at a self-hosted Milvus server or Zilliz Cloud. Milvus Lite is still local to
+one palace directory, so use a server URI for team mode.
+
+Install the optional Milvus driver on the server host:
+
+```bash
+pip install mempalace[milvus]
+```
+
+Point MemPalace at the shared Milvus endpoint:
+
+```bash
+export MEMPALACE_BACKEND=milvus
+export MEMPALACE_MILVUS_URI=https://your-cluster.api.region.zillizcloud.com
+export MEMPALACE_MILVUS_TOKEN=your-token
+```
+
+Prefer Qdrant? It needs no extra Python package — MemPalace talks to its REST
+API directly.
 
 Run Qdrant (Docker shown; use a managed/self-hosted instance you control):
 
@@ -59,14 +78,20 @@ export MEMPALACE_QDRANT_API_KEY=your-qdrant-api-key   # if your Qdrant requires 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MEMPALACE_BACKEND` | `chroma` | Set to `qdrant` (or `pgvector`) to select the backend |
+| `MEMPALACE_BACKEND` | `chroma` | Set to `milvus`, `qdrant`, or `pgvector` to select the backend |
+| `MEMPALACE_MILVUS_URI` | per-palace Milvus Lite | Milvus server / Zilliz Cloud URI |
+| `MEMPALACE_MILVUS_TOKEN` | _(none)_ | Token for Milvus server / Zilliz Cloud |
+| `MEMPALACE_MILVUS_DB_NAME` | _(none)_ | Optional Milvus database name |
+| `MEMPALACE_MILVUS_NAMESPACE` | _(none)_ | Optional Milvus collection namespace prefix |
+| `MEMPALACE_MILVUS_CONSISTENCY_LEVEL` | `Strong` | Milvus consistency level |
 | `MEMPALACE_QDRANT_URL` | `http://localhost:6333` | Qdrant REST endpoint |
 | `MEMPALACE_QDRANT_API_KEY` | _(none)_ | Sent as the `api-key` header when set |
 | `MEMPALACE_QDRANT_NAMESPACE` | _(none)_ | Optional collection namespace prefix |
 | `MEMPALACE_QDRANT_TIMEOUT` | backend default | REST request timeout (seconds) |
 
-The backend can also be set with `--backend qdrant` on any `mempalace` /
-`mempalace-mcp` command, or with `"backend": "qdrant"` in `config.json`.
+The backend can also be set with `--backend milvus` (or `qdrant` /
+`pgvector`) on any `mempalace` / `mempalace-mcp` command, or with
+`"backend": "milvus"` in `config.json`.
 
 Prefer Postgres? Install `pip install mempalace[pgvector]`, point
 `MEMPALACE_BACKEND=pgvector` at a database with the `vector` extension, and
@@ -96,7 +121,7 @@ ready-to-paste client config, and runs in the foreground so Docker/systemd own
 the lifecycle.
 
 ```bash
-mempalace serve --host 0.0.0.0 --port 8765 --backend qdrant
+mempalace serve --host 0.0.0.0 --port 8765 --backend milvus
 ```
 
 Output includes the token and the exact client command. Useful flags:
@@ -159,8 +184,9 @@ whole team.
   processes at the same backend collection.
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
   works as a load-balancer/Kubernetes liveness probe.
-- **Backups** are now your storage backend's responsibility (Qdrant snapshots
-  / Postgres backups) rather than a single laptop's palace directory.
+- **Backups** are now your storage backend's responsibility (Milvus / Zilliz
+  Cloud backups, Qdrant snapshots, or Postgres backups) rather than a single
+  laptop's palace directory.
 
 ## One-command deployments
 

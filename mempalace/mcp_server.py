@@ -342,6 +342,11 @@ _last_request_time: float = time.monotonic()
 _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
+# Serializes quick_check runs between the async startup preflight thread and
+# lazy consumers on the protocol thread (double-checked in
+# _ensure_sqlite_integrity_status) so the O(database size) probe never runs
+# twice concurrently.
+_sqlite_integrity_refresh_lock = threading.Lock()
 _SQLITE_INTEGRITY_ERROR_CODE = -32002
 _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
@@ -349,6 +354,19 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         "mempalace_reconnect",
     }
 )
+
+# The startup probe above runs PRAGMA quick_check, which reads every page of
+# chroma.sqlite3 and is therefore O(database size). On multi-GB palaces it can
+# exceed the MCP client's connection/handshake timeout, so the server never
+# finishes starting and the client drops the connection (the peer-writer guard
+# and lazy consumers all funnel through _refresh_sqlite_integrity_status). Skip
+# the *startup* probe when the database exceeds this size (MB). `mempalace
+# repair` still runs the full quick_check via repair.sqlite_integrity_errors
+# before any destructive rebuild, so corruption is still caught where it
+# matters. Set MEMPALACE_STARTUP_INTEGRITY_MAX_MB=0 to disable the gate and
+# always run the startup probe.
+_STARTUP_INTEGRITY_MAX_MB_ENV = "MEMPALACE_STARTUP_INTEGRITY_MAX_MB"
+_STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 
 
 # MCP peer-writer guard (#1818).
@@ -368,11 +386,14 @@ _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
         "mempalace_add_drawer",
         "mempalace_delete_drawer",
+        "mempalace_checkpoint",
+        "mempalace_delete_by_source",
         "mempalace_mine",
         "mempalace_sync",
         "mempalace_update_drawer",
@@ -389,9 +410,17 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
-    when another live writer already owns the per-palace lease. Once a server
-    starts read-only it stays read-only for its lifetime; restarting is the
-    safe way to become the writer after the original holder exits.
+    when another live writer already owns the per-palace lease.
+
+    Self-healing: a server that came up read-only (a peer held the lease at
+    startup) RE-ATTEMPTS the non-blocking flock on every subsequent call.
+    ``_mcp_peer_writer_refusal`` invokes this on each mutating tool, so once
+    the original holder exits — the OS releases its flock on process death —
+    the next mutating call transparently promotes this server to writer, with
+    no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
+    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` is now only a
+    status flag; it no longer short-circuits the retry (that sticky latch used
+    to strand a server read-only for life even after the peer was long gone).
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
@@ -415,9 +444,10 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
-    if _MCP_WRITER_READ_ONLY:
-        return False, _MCP_WRITER_LOCK_ERROR
-
+    # NB: deliberately NO sticky read-only short-circuit here. If a peer held
+    # the lease at startup we fall through and retry mine_palace_lock below, so
+    # the server self-heals into the writer the moment the peer exits. A broken
+    # lock *mechanism* (below) is still cached, since retrying it can't help.
     if _MCP_WRITER_LOCK_FAILED:
         return True, _MCP_WRITER_LOCK_ERROR
 
@@ -477,6 +507,33 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     }
 
 
+def _startup_integrity_size_limit_bytes() -> int:
+    """Byte size above which the startup SQLite quick_check is skipped.
+
+    Returns 0 when the gate is disabled (``MEMPALACE_STARTUP_INTEGRITY_MAX_MB``
+    set to 0, a non-positive number, or an unparseable value), meaning the
+    startup probe always runs.
+    """
+
+    raw = os.environ.get(_STARTUP_INTEGRITY_MAX_MB_ENV, "").strip()
+    if not raw:
+        mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    else:
+        try:
+            mb = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r; using default %.0f MB",
+                _STARTUP_INTEGRITY_MAX_MB_ENV,
+                raw,
+                _STARTUP_INTEGRITY_MAX_MB_DEFAULT,
+            )
+            mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    if mb <= 0:
+        return 0
+    return int(mb * 1024 * 1024)
+
+
 def _refresh_sqlite_integrity_status() -> None:
     """Refresh the MCP startup SQLite/FTS5 integrity gate.
 
@@ -486,6 +543,12 @@ def _refresh_sqlite_integrity_status() -> None:
     SQLite-layer corruption (#1818).
     """
 
+    with _sqlite_integrity_refresh_lock:
+        _refresh_sqlite_integrity_status_locked()
+
+
+def _refresh_sqlite_integrity_status_locked() -> None:
+    # Probe body; callers must hold _sqlite_integrity_refresh_lock.
     global _sqlite_integrity_checked
     global _sqlite_integrity_errors
     global _sqlite_integrity_check_error
@@ -495,6 +558,29 @@ def _refresh_sqlite_integrity_status() -> None:
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
         return
+
+    max_bytes = _startup_integrity_size_limit_bytes()
+    if max_bytes > 0:
+        sqlite_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+        try:
+            db_bytes = os.path.getsize(sqlite_path)
+        except OSError:
+            db_bytes = 0
+        if db_bytes > max_bytes:
+            _sqlite_integrity_checked = True
+            _sqlite_integrity_errors = []
+            _sqlite_integrity_check_error = ""
+            logger.warning(
+                "SQLite startup integrity check skipped: %s is %.0f MB "
+                "(> %.0f MB limit); PRAGMA quick_check would block MCP "
+                "startup. Run `mempalace repair` for a full check, or set "
+                "%s (MB; 0 disables the limit).",
+                sqlite_path,
+                db_bytes / (1024 * 1024),
+                max_bytes / (1024 * 1024),
+                _STARTUP_INTEGRITY_MAX_MB_ENV,
+            )
+            return
 
     try:
         from .repair import sqlite_integrity_errors
@@ -520,12 +606,46 @@ def _refresh_sqlite_integrity_status() -> None:
 
 
 def _ensure_sqlite_integrity_status() -> None:
-    if not _sqlite_integrity_checked:
-        _refresh_sqlite_integrity_status()
+    if _sqlite_integrity_checked:
+        return
+    with _sqlite_integrity_refresh_lock:
+        # Double-checked: the startup preflight thread may have finished the
+        # probe while this caller waited on the lock — don't pay the
+        # O(database size) quick_check twice.
+        if not _sqlite_integrity_checked:
+            _refresh_sqlite_integrity_status_locked()
 
 
 def _sqlite_integrity_payload() -> dict:
     _ensure_sqlite_integrity_status()
+
+    # The integrity gate only knows how to check chroma.sqlite3, and
+    # _refresh_sqlite_integrity_status short-circuits for non-chroma backends,
+    # so on a non-chroma backend no quick_check runs. Reporting checked/ok true
+    # would imply a verification that never happened and reference a
+    # chroma.sqlite3 the active backend does not use (#1931). Recorded errors
+    # only ever come from the chroma path, so surface them regardless of the
+    # backend lookup (which may itself fail); only the clean case is
+    # reclassified as not-applicable.
+    if not _sqlite_integrity_errors:
+        try:
+            backend_name = _selected_backend_name()
+        except Exception:
+            logger.debug("backend resolution failed for integrity payload", exc_info=True)
+            backend_name = ""
+        if backend_name != "chroma":
+            return {
+                "checked": False,
+                "ok": None,
+                "palace": _config.palace_path or "",
+                "sqlite_path": "",
+                "error_count": 0,
+                "errors": [],
+                "reason": (
+                    "chroma.sqlite3 integrity check does not run for backend "
+                    f"{backend_name or 'unknown'!r}"
+                ),
+            }
 
     payload = {
         "checked": _sqlite_integrity_checked,
@@ -1666,9 +1786,6 @@ def tool_status():
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
-    writer_ok, writer_reason = _acquire_mcp_writer_lock()
-    if not writer_ok:
-        logger.warning("%s; mutating MCP tools will run read-only", writer_reason)
 
     if _vector_disabled:
         return _tool_status_via_sqlite()
@@ -1771,7 +1888,7 @@ PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
@@ -3341,6 +3458,57 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     }
 
 
+def tool_kg_supersede(
+    subject: str,
+    predicate: str,
+    old_object: str,
+    new_object: str,
+    at: str = None,
+):
+    """Atomically replace one fact with another at a single shared boundary.
+
+    Closes ``(subject, predicate, old_object)`` and opens
+    ``(subject, predicate, new_object)`` at one shared instant, so a
+    point-in-time query at the boundary returns only the new value. Use this
+    instead of a separate ``kg_invalidate`` + ``kg_add`` when a single-valued
+    fact changes (e.g. a model, employer, or address changes).
+
+    ``at`` accepts ``YYYY-MM-DD`` or a canonical UTC datetime
+    (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
+    """
+    try:
+        subject = sanitize_kg_value(subject, "subject")
+        predicate = sanitize_name(predicate, "predicate")
+        old_object = sanitize_kg_value(old_object, "old_object")
+        new_object = sanitize_kg_value(new_object, "new_object")
+        at = sanitize_iso_temporal(at, "at")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    _wal_log(
+        "kg_supersede",
+        {
+            "subject": subject,
+            "predicate": predicate,
+            "old_object": old_object,
+            "new_object": new_object,
+            "at": at,
+        },
+    )
+
+    # Domain ValueErrors from kg.supersede (e.g. inverted boundary) are left to
+    # bubble to the dispatcher, matching tool_kg_add / tool_kg_invalidate: the
+    # -32000 response carries error_class + message in error.data. Only input
+    # sanitization above returns the {success: False} envelope.
+    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
+    return {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {new_object}",
+        "superseded": old_object,
+    }
+
+
 def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
     if entity is not None:
@@ -3779,7 +3947,7 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
-def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     """Batch session save in a single call.
 
     Semantic-dedups each item, files the non-duplicates as drawers, then
@@ -3790,6 +3958,9 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
 
     ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
     is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    ``added_by`` attributes the filed drawers; when omitted it falls back to
+    the diary's ``agent_name`` (and then to ``"checkpoint"``), so the agent
+    that filed the session is recorded instead of a generic label.
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
@@ -3806,6 +3977,20 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
+    # Drawer attribution: an explicit ``added_by`` wins; otherwise fall back to
+    # the diary's ``agent_name`` (the agent filing this session); otherwise the
+    # legacy ``"checkpoint"`` label. A blank, whitespace-only, or non-string
+    # value counts as unspecified at each step, so an empty explicit argument
+    # still defers to the diary instead of masking it. The chosen name is stored
+    # verbatim (tool_add_drawer strips lone surrogates but does not case-fold),
+    # matching how every other caller records ``added_by``; the diary index
+    # lowercases the same name separately for case-insensitive reads.
+    resolved_added_by = added_by if isinstance(added_by, str) and added_by.strip() else None
+    if resolved_added_by is None and isinstance(diary, dict):
+        agent = diary.get("agent_name")
+        resolved_added_by = agent if isinstance(agent, str) and agent.strip() else None
+    if resolved_added_by is None:
+        resolved_added_by = "checkpoint"
     for item in items:
         if not isinstance(item, dict):
             out["errors"].append({"item": item, "error": "item must be an object"})
@@ -3828,7 +4013,7 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -3959,6 +4144,27 @@ TOOLS = {
             "required": ["subject", "predicate", "object"],
         },
         "handler": tool_kg_invalidate,
+    },
+    "mempalace_kg_supersede": {
+        "description": "Atomically replace a fact with its successor at a shared boundary. Use when a single-valued fact changes (model, employer, address) instead of separate kg_invalidate + kg_add — a point-in-time query at the boundary then returns only the new value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity whose fact is changing"},
+                "predicate": {
+                    "type": "string",
+                    "description": "The relationship type (e.g. 'uses_model', 'works_at')",
+                },
+                "old_object": {"type": "string", "description": "The value being replaced"},
+                "new_object": {"type": "string", "description": "The new value"},
+                "at": {
+                    "type": "string",
+                    "description": "Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional; defaults to now UTC)",
+                },
+            },
+            "required": ["subject", "predicate", "old_object", "new_object"],
+        },
+        "handler": tool_kg_supersede,
     },
     "mempalace_kg_timeline": {
         "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
@@ -4211,6 +4417,10 @@ TOOLS = {
                 "dedup_threshold": {
                     "type": "number",
                     "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
+                },
+                "added_by": {
+                    "type": "string",
+                    "description": "Who is filing these drawers. An explicit value takes precedence; otherwise the diary agent_name, else 'checkpoint'.",
                 },
             },
             "required": ["items"],
@@ -5095,6 +5305,28 @@ def _build_http_server(host: str, port: int):
         daemon_threads = True
         allow_reuse_address = True
 
+        def handle_error(self, request, client_address):
+            # A client hanging up mid-response makes the send path raise
+            # ConnectionError (BrokenPipeError / ConnectionResetError), or
+            # ssl.SSLEOFError over TLS. That is a routine disconnect, not a
+            # server fault, so log it at DEBUG rather than let the default
+            # handler dump a per-request traceback. Real errors (including
+            # genuine TLS handshake/cert failures) still reach that handler.
+            exc = sys.exc_info()[1]
+            is_disconnect = isinstance(exc, ConnectionError)
+            if not is_disconnect:
+                import ssl
+
+                # Only the abrupt-EOF SSLError; genuine TLS errors must surface.
+                is_disconnect = isinstance(exc, ssl.SSLEOFError)
+            if is_disconnect:
+                logger.debug(
+                    "HTTP client %s disconnected before the response completed",
+                    client_address,
+                )
+                return
+            super().handle_error(request, client_address)
+
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 10
@@ -5264,6 +5496,21 @@ def _serve_http(host: str, port: int) -> None:
             logger.info("MemPalace MCP HTTP server shutting down")
 
 
+def _startup_preflight() -> None:
+    """Startup SQLite integrity + HNSW capacity probes, off the protocol thread.
+
+    Runs the same checks the stdio loop used to run synchronously before
+    reading the first request. Failures must never take down the server: the
+    lazy consumers (_ensure_sqlite_integrity_status, _get_client) re-run or
+    re-check on demand, so an exception here only loses the early warning.
+    """
+    try:
+        _ensure_sqlite_integrity_status()
+        _refresh_vector_disabled_flag()
+    except Exception:
+        logger.exception("startup preflight failed")
+
+
 def _run_stdio_loop() -> None:
     _restore_stdout()
 
@@ -5280,11 +5527,19 @@ def _run_stdio_loop() -> None:
 
     logger.info("MemPalace MCP Server starting...")
 
-    # Pre-flight: probe HNSW capacity before any tool call so the warning
-    # is visible at startup rather than on first use (#1222). Pure
-    # filesystem read; never opens a chromadb client.
-    _refresh_sqlite_integrity_status()
-    _refresh_vector_disabled_flag()
+    # Pre-flight in a background thread: PRAGMA quick_check reads every page
+    # of chroma.sqlite3 (20s+ on multi-GB palaces) and running it before the
+    # protocol loop starves the client's initialize timeout, even though the
+    # handshake itself never touches the database. The #1222 intent (warnings
+    # visible at startup rather than on first use) is preserved — the probe
+    # starts now and logs as soon as it finishes; tool calls that need the
+    # verdict serialize on _sqlite_integrity_refresh_lock via
+    # _ensure_sqlite_integrity_status instead of re-running the probe.
+    threading.Thread(
+        target=_startup_preflight,
+        name="mcp-startup-preflight",
+        daemon=True,
+    ).start()
 
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client

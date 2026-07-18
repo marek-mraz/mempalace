@@ -363,6 +363,30 @@ class TestScanConvos:
         files = scan_convos(str(tmp_path))
         assert files == []
 
+    def test_scan_skips_tool_results_dirs(self, tmp_path):
+        # Claude Code pages large tool outputs to <session>/tool-results/*.txt
+        # inside ~/.claude/projects/<slug>/. These are raw machine dumps
+        # referenced from the transcript JSONL, not conversations — mining
+        # them floods the palace (12.8k drawers measured in the field, one
+        # single file produced 3.6k). The scanner must not descend into them.
+        session_dir = tmp_path / "1234-5678-session"
+        tool_results = session_dir / "tool-results"
+        tool_results.mkdir(parents=True)
+        (tool_results / "bipc8jdx0.txt").write_text("raw tool dump " * 100, encoding="utf-8")
+        (tmp_path / "session.jsonl").write_text('{"type": "user"}', encoding="utf-8")
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "session.jsonl" in names
+        assert "bipc8jdx0.txt" not in names
+
+    def test_scan_keeps_regular_nested_dirs(self, tmp_path):
+        # The tool-results skip must not turn into a blanket nested-dir skip.
+        nested = tmp_path / "archive"
+        nested.mkdir()
+        (nested / "old-chat.md").write_text("> q\na\n> q2\na2\n> q3\na3", encoding="utf-8")
+        files = scan_convos(str(tmp_path))
+        assert [f.name for f in files] == ["old-chat.md"]
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="symlink creation requires elevated privileges on Windows",
@@ -431,6 +455,59 @@ class TestScanConvos:
         # not just the leaf — proves relative_to(convo_path) over .name.
         assert "deep/subdir/nested.jsonl" in err
         assert "(symlink)" in err
+
+    def test_scan_skips_oversized_files(self, tmp_path, capsys, monkeypatch):
+        import re
+
+        import mempalace.convo_miner as convo_mod
+
+        monkeypatch.setattr(convo_mod, "MAX_FILE_SIZE", 100)
+
+        (tmp_path / "small.txt").write_text("hello " * 5, encoding="utf-8")
+        (tmp_path / "big.txt").write_text("hello " * 100, encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "small.txt" in names
+        assert "big.txt" not in names
+
+        err = capsys.readouterr().err
+        # SKIP message goes to stderr, matching the existing
+        # `SKIP: <rel> (symlink)` line in the same function.
+        assert "SKIP: big.txt" in err
+        # Validate the full template so a drop of the MB suffix or a
+        # regression to bare-substring output trips the test.
+        assert re.search(r"SKIP: big\.txt \(\d+\.\d+ MB\) exceeds \d+ MB limit", err), err
+
+    def test_scan_skips_unreadable_files(self, tmp_path, capsys, monkeypatch):
+        from pathlib import Path
+
+        # .txt is in CONVO_EXTENSIONS so it reaches the size-check gate.
+        (tmp_path / "readable.txt").write_text("hi", encoding="utf-8")
+        unreadable = tmp_path / "unreadable.txt"
+        unreadable.write_text("hi", encoding="utf-8")
+
+        real_stat = Path.stat
+
+        def selective_stat(self, *args, **kwargs):
+            # On Py 3.10+, Path.is_symlink() routes through lstat ->
+            # stat(follow_symlinks=False). Only raise for the follow-symlinks
+            # call that the actual size-check makes, otherwise the test
+            # never reaches the size-check arm we want to exercise.
+            if self.name == "unreadable.txt" and kwargs.get("follow_symlinks", True):
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", selective_stat)
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "readable.txt" in names
+        assert "unreadable.txt" not in names
+
+        err = capsys.readouterr().err
+        assert "SKIP: unreadable.txt" in err
+        assert "stat error" in err
 
 
 class TestFileChunksLocked:

@@ -1997,6 +1997,205 @@ class TestWriteTools:
         assert "mempalace_checkpoint" in mcp_server.TOOLS
         assert mcp_server.TOOLS["mempalace_checkpoint"]["handler"] is mcp_server.tool_checkpoint
 
+    def test_checkpoint_added_by_defaults_to_diary_agent(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """#2023: with no explicit ``added_by``, each filed drawer is attributed
+        to the diary ``agent_name`` (verbatim case) rather than the generic
+        ``checkpoint`` label, so the filing agent survives in provenance."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        _client.close()  # release file handles; a bare del leaks them on Windows (#1128)
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[{"wing": "w", "room": "decisions", "content": "Use PostgreSQL for storage."}],
+            diary={"agent_name": "DeepSeek", "wing": "w", "entry": "SESSION|did.stuff|star"},
+        )
+        assert len(result["added"]) == 1
+
+        client, col = _get_collection(palace_path)
+        try:
+            metas = col.get(include=["metadatas"])["metadatas"]
+        finally:
+            client.close()
+        drawers = [m for m in metas if m.get("room") == "decisions"]
+        assert len(drawers) == 1
+        # Verbatim case, not the lowercased diary-index form of agent_name.
+        assert drawers[0]["added_by"] == "DeepSeek"
+
+    def test_checkpoint_explicit_added_by_overrides_diary(self, monkeypatch):
+        """An explicit ``added_by`` wins over the diary ``agent_name`` fallback."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "keep me"}],
+            diary={"agent_name": "deepseek", "entry": "SESSION|x|star"},
+            added_by="alice",
+        )
+        assert filed["added_by"] == "alice"
+
+    def test_checkpoint_added_by_falls_back_to_checkpoint_label(self, monkeypatch):
+        """Neither an explicit ``added_by`` nor a diary ``agent_name`` -> the
+        drawer keeps the legacy ``checkpoint`` attribution (backward compatible)."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        seen = []
+
+        def _add(**kwargs):
+            seen.append(kwargs["added_by"])
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        # No diary block at all.
+        mcp_server.tool_checkpoint(items=[{"wing": "w", "room": "r", "content": "a"}])
+        # Diary present but without an ``agent_name``.
+        mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "b"}],
+            diary={"entry": "SESSION|y|star"},
+        )
+        assert seen == ["checkpoint", "checkpoint"]
+
+    def test_checkpoint_added_by_accepted_via_dispatch(self, monkeypatch):
+        """#2023: ``added_by`` passes the tools/call schema whitelist (the
+        reporter's HTTP MCP transport reuses this dispatcher) and the real
+        handler forwards it, for both the explicit value and the diary fallback."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {
+                    "name": "mempalace_checkpoint",
+                    "arguments": {
+                        "items": [{"wing": "w", "room": "r", "content": "hi"}],
+                        "added_by": "alice",
+                    },
+                },
+            }
+        )
+        assert "error" not in resp
+        assert filed["added_by"] == "alice"
+
+        filed.clear()
+        resp2 = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_checkpoint",
+                    "arguments": {
+                        "items": [{"wing": "w", "room": "r", "content": "yo"}],
+                        "diary": {"agent_name": "DeepSeek", "entry": "SESSION|z|star"},
+                    },
+                },
+            }
+        )
+        assert "error" not in resp2
+        assert filed["added_by"] == "DeepSeek"
+
+    def test_checkpoint_schema_exposes_added_by(self):
+        """``added_by`` is declared in the checkpoint tool schema so the
+        dispatch whitelist admits it instead of rejecting it as unknown."""
+        from mempalace import mcp_server
+
+        props = mcp_server.TOOLS["mempalace_checkpoint"]["input_schema"]["properties"]
+        assert "added_by" in props
+        assert props["added_by"]["type"] == "string"
+
+    def test_checkpoint_blank_or_invalid_added_by_defers_to_diary(self, monkeypatch):
+        """A blank, whitespace-only, non-string, or None explicit ``added_by``
+        counts as unspecified, so it defers to the diary ``agent_name`` rather
+        than masking it; with no usable diary name it falls to ``checkpoint``."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        seen = []
+
+        def _add(**kwargs):
+            seen.append(kwargs["added_by"])
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        diary = {"agent_name": "deepseek", "entry": "SESSION|x|star"}
+        for bad in ("", "   ", 123, None):
+            mcp_server.tool_checkpoint(
+                items=[{"wing": "w", "room": "r", "content": f"c{bad!r}"}],
+                diary=diary,
+                added_by=bad,
+            )
+        # Every unusable explicit value defers to the diary agent.
+        assert seen == ["deepseek", "deepseek", "deepseek", "deepseek"]
+
+        # Blank explicit AND a blank diary name -> the legacy label.
+        seen.clear()
+        mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "z"}],
+            diary={"agent_name": "   ", "entry": "SESSION|y|star"},
+            added_by="",
+        )
+        assert seen == ["checkpoint"]
+
+    def test_checkpoint_added_by_uniform_across_items(self, monkeypatch):
+        """All items in one checkpoint share a single resolved author (a
+        checkpoint is one agent's session save; attribution is resolved once)."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        seen = []
+
+        def _add(**kwargs):
+            seen.append(kwargs["added_by"])
+            return {"success": True, "drawer_id": kwargs["content"]}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        mcp_server.tool_checkpoint(
+            items=[
+                {"wing": "w", "room": "r", "content": "one"},
+                {"wing": "w", "room": "r", "content": "two"},
+            ],
+            diary={"agent_name": "DeepSeek", "entry": "SESSION|q|star"},
+        )
+        assert seen == ["DeepSeek", "DeepSeek"]
+
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_get_drawer
@@ -2877,6 +3076,27 @@ class TestKGTools:
         # Regression #1314: response must echo the actual ended date,
         # not silently drop it and return the literal string "today".
         assert result["ended"] == "2026-03-01"
+
+    def test_kg_supersede(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "uses_model", "old", valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot",
+            predicate="uses_model",
+            old_object="old",
+            new_object="new",
+            at="2026-06-02",
+        )
+        assert result["success"] is True
+        assert result["superseded"] == "old"
+        models = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-06-02", direction="outgoing")
+            if f["predicate"] == "uses_model"
+        ]
+        assert models == ["new"]
 
     def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
         """Regression #1314 case 1: valid_to must round-trip through kg_add."""
@@ -4829,6 +5049,27 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     assert '"ok": true' in response["result"]["content"][0]["text"]
 
 
+def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("status should not acquire the peer-writer lock")
+
+    monkeypatch.setattr(mcp_server, "_ensure_sqlite_integrity_status", lambda: None)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", None)
+    monkeypatch.setattr(mcp_server, "_backend_db_exists", lambda: True)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_tool_status_via_sqlite",
+        lambda: {"total_drawers": 0, "wings": {}, "rooms": {}},
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    assert mcp_server.tool_status()["total_drawers"] == 0
+
+
 def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     from mempalace import mcp_server, palace
 
@@ -4855,6 +5096,50 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     assert mcp_server._MCP_WRITER_LOCK_FAILED is True
     assert "continuing without peer-writer protection" in reason_first
     assert reason_second == reason_first
+
+
+def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
+    """A server that came up read-only must retry the flock and promote itself
+    to writer once the peer holding the lease exits — no restart required."""
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def flaky_mine_palace_lock(palace_path):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # First attempt: a live peer still holds the lease.
+            raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
+        # Second attempt: peer has exited, flock is free.
+        return _DummyLock()
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", flaky_mine_palace_lock)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    # First call: refused, latched read-only for reporting.
+    ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
+    assert ok_first is False
+    assert mcp_server._MCP_WRITER_READ_ONLY is True
+    assert "already holds" in reason_first
+
+    # Second call: the sticky latch must NOT short-circuit — retry succeeds.
+    ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
+    assert ok_second is True
+    assert reason_second == ""
+    assert calls["count"] == 2  # retried, not stranded read-only
+    assert mcp_server._MCP_WRITER_LOCK_CM is not None
+    assert mcp_server._MCP_WRITER_READ_ONLY is False
 
 
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
@@ -4919,6 +5204,73 @@ def test_sqlite_integrity_status_surfaces_payload_without_chroma(monkeypatch):
     assert "malformed inverted index" in payload["sqlite_integrity"]["errors"][0]
 
 
+def test_sqlite_integrity_payload_not_applicable_on_non_chroma_backend(monkeypatch):
+    """#1931: a non-chroma backend runs no sqlite quick_check, so status must
+    report the check as not-applicable rather than implying it passed.
+
+    Before the fix the payload reported ``checked=True``/``ok=True`` and a
+    ``chroma.sqlite3`` path that does not exist for the active backend.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "qdrant")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "qdrant" in payload["reason"]
+    # No chroma.sqlite3 reference and a shape stable with the chroma payload.
+    assert payload["sqlite_path"] == ""
+    assert payload["error_count"] == 0
+    assert payload["errors"] == []
+
+
+def test_sqlite_integrity_payload_reports_unknown_when_backend_unresolvable(monkeypatch):
+    """#1931: if backend resolution raises, status still must not claim an
+    integrity pass; it reports not-applicable for an unknown backend.
+    """
+    from mempalace import mcp_server
+
+    def _boom():
+        raise RuntimeError("backend registry unavailable")
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", _boom)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "unknown" in payload["reason"]
+
+
+def test_sqlite_integrity_payload_full_shape_on_chroma_backend(monkeypatch):
+    """#1931 guard: a chroma backend with no recorded errors must still return
+    the full integrity payload; the not-applicable branch must not swallow the
+    chroma path.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is True
+    assert payload["ok"] is True
+    assert "sqlite_path" in payload
+    assert payload["error_count"] == 0
+    assert "reason" not in payload
+
+
 def test_sqlite_integrity_reconnect_allowed_when_corrupt(monkeypatch):
     from mempalace import mcp_server
 
@@ -4978,6 +5330,90 @@ def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch)
     assert mcp_server._sqlite_integrity_checked is True
     assert len(mcp_server._sqlite_integrity_errors) == 1
     assert "malformed inverted index" in mcp_server._sqlite_integrity_errors[0]
+
+
+def test_refresh_sqlite_integrity_status_skips_oversized_db(monkeypatch, tmp_path):
+    """Oversized chroma.sqlite3 must NOT run the O(size) startup quick_check."""
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (2 * 1024 * 1024))  # 2 MB
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")  # limit 1 MB < 2 MB
+
+    called = {"n": 0}
+
+    def _boom(palace_path):
+        called["n"] += 1
+        raise AssertionError("quick_check must not run for oversized DB")
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", _boom)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["stale"])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert called["n"] == 0
+    assert mcp_server._sqlite_integrity_checked is True
+    assert mcp_server._sqlite_integrity_errors == []
+
+
+def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_path):
+    """A DB under the limit still runs the quick_check (behaviour preserved)."""
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (512 * 1024))  # 0.5 MB
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")  # limit 1 MB > 0.5 MB
+
+    called = {"n": 0}
+
+    def _spy(palace_path):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", _spy)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert called["n"] == 1
+    assert mcp_server._sqlite_integrity_checked is True
+
+
+def test_startup_integrity_size_gate_disabled_with_zero(monkeypatch, tmp_path):
+    """MEMPALACE_STARTUP_INTEGRITY_MAX_MB=0 disables the gate: check always runs."""
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (4 * 1024 * 1024))  # 4 MB
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "0")
+
+    called = {"n": 0}
+
+    def _spy(palace_path):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", _spy)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert called["n"] == 1
 
 
 def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):
@@ -5122,3 +5558,97 @@ class TestListDrawersDateFilters:
 
         since = datetime(2026, 1, 2)
         assert _filed_at_in_window("2026-01-02T08:00:00Z", since, None) is True
+
+
+# ── MCP stdio startup: async preflight ───────────────────────────────────
+
+
+def test_startup_preflight_does_not_block_initialize(monkeypatch):
+    """The startup integrity probe is O(database size) (PRAGMA quick_check
+    reads every page of chroma.sqlite3 — 20s+ on multi-GB palaces) and used
+    to run before the protocol loop, starving the client's initialize
+    timeout. It now runs on the mcp-startup-preflight thread; the handshake
+    must answer immediately while the probe is still in flight."""
+    import threading
+    import time
+
+    from mempalace import mcp_server
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def slow_probe():
+        probe_started.set()
+        release_probe.wait(10)
+        mcp_server._sqlite_integrity_checked = True
+
+    monkeypatch.setattr(mcp_server, "_refresh_sqlite_integrity_status_locked", slow_probe)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+
+    preflight = threading.Thread(target=mcp_server._startup_preflight, daemon=True)
+    preflight.start()
+    try:
+        assert probe_started.wait(5), "preflight thread never started the probe"
+
+        started = time.monotonic()
+        response = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"},
+            }
+        )
+        elapsed = time.monotonic() - started
+
+        assert response["result"]["serverInfo"]["name"] == "mempalace"
+        assert elapsed < 1.0, f"initialize blocked {elapsed:.2f}s behind the startup probe"
+    finally:
+        release_probe.set()
+        preflight.join(5)
+
+
+def test_ensure_sqlite_integrity_status_joins_inflight_probe(monkeypatch):
+    """A lazy consumer (tool-call integrity gate) arriving while the startup
+    preflight probe is still running must wait for that probe's verdict on
+    _sqlite_integrity_refresh_lock — not run a second O(database size)
+    quick_check concurrently, and not proceed without a verdict."""
+    import threading
+
+    from mempalace import mcp_server
+
+    probe_calls = []
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def slow_probe():
+        probe_calls.append(1)
+        probe_started.set()
+        release_probe.wait(10)
+        mcp_server._sqlite_integrity_checked = True
+
+    monkeypatch.setattr(mcp_server, "_refresh_sqlite_integrity_status_locked", slow_probe)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+
+    background = threading.Thread(target=mcp_server._refresh_sqlite_integrity_status, daemon=True)
+    background.start()
+    assert probe_started.wait(5), "background probe never started"
+
+    consumer_done = threading.Event()
+
+    def consumer():
+        mcp_server._ensure_sqlite_integrity_status()
+        consumer_done.set()
+
+    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    consumer_thread.start()
+    try:
+        assert not consumer_done.wait(0.3), "consumer bypassed the in-flight probe"
+        release_probe.set()
+        assert consumer_done.wait(5), "consumer never unblocked after the probe finished"
+        assert probe_calls == [1], "quick_check probe ran more than once"
+    finally:
+        release_probe.set()
+        background.join(5)
+        consumer_thread.join(5)
